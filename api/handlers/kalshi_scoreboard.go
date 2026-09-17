@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/malbeclabs/lake/utils/pkg/logger"
 )
 
 // The Kalshi scoreboard is the sibling of the Hyperliquid one (hyperliquid_scoreboard.go) and
@@ -975,17 +977,24 @@ func (a *API) StartKalshiBackgroundRefresher(ctx context.Context) {
 			slog.Warn("kalshi scoreboard cache write failed", "window", window, "error", err)
 		}
 	}
+	// The market-by-price half of the same column, and the heaviest scan in the chain. Same
+	// escalation for the same reason: its failure leaves the Sequence column with one leg and
+	// nothing on the page says which.
+	var l2Esc logger.Escalator
+	const l2EscKey = "kalshi_l2_coverage"
 	refreshL2 := func() {
 		rctx, cancel := context.WithTimeout(ctx, runTimeout)
 		defer cancel()
 		val, err := a.FetchKalshiL2Coverage(rctx)
 		if err != nil {
-			slog.Warn("kalshi l2 coverage refresh failed", "error", err)
+			l2Esc.Fail(slog.Default(), l2EscKey, "kalshi l2 coverage refresh failed", "error", err)
 			return
 		}
 		if err := a.WritePageCache(ctx, kalshiL2CoverageCacheKey, val); err != nil {
-			slog.Warn("kalshi l2 coverage cache write failed", "error", err)
+			l2Esc.Fail(slog.Default(), l2EscKey, "kalshi l2 coverage cache write failed", "error", err)
+			return
 		}
+		l2Esc.Reset(l2EscKey)
 	}
 	// The observations-plane leg of /dz/edge/multicast: the top-of-book sequence series and the
 	// path-parity counts. Same cadence and same window as the L2 coverage one so the two halves
@@ -999,22 +1008,72 @@ func (a *API) StartKalshiBackgroundRefresher(ctx context.Context) {
 	// the deploy that introduced this one, the columns stayed empty for a whole cycle. Cheapest
 	// step in the chain (2-4s against mainnet) and the only one with nothing to fall back on, so
 	// it goes at the front.
+	// **Escalated too, and this is the leg the rule was written from.** It failed on every
+	// ten-minute cycle in production against a ClickHouse memory limit and cost the strips
+	// silently, which is the precedent the recorded-gap leg below cites for its own escalator.
+	// Citing it while leaving it at WARN would have meant the failure that motivated the rule
+	// still never pages.
+	var observationsEsc logger.Escalator
+	const observationsEscKey = "edge_multicast_observations"
 	refreshObservations := func() {
 		rctx, cancel := context.WithTimeout(ctx, runTimeout)
 		defer cancel()
 		val, err := a.FetchEdgeMulticastObservations(rctx)
 		if err != nil {
-			slog.Warn("edge multicast observations refresh failed", "error", err)
+			observationsEsc.Fail(slog.Default(), observationsEscKey,
+				"edge multicast observations refresh failed", "error", err)
 			return
 		}
 		if err := a.WritePageCache(ctx, edgeMulticastObservationsCacheKey, val); err != nil {
-			slog.Warn("edge multicast observations cache write failed", "error", err)
+			observationsEsc.Fail(slog.Default(), observationsEscKey,
+				"edge multicast observations cache write failed", "error", err)
+			return
 		}
+		observationsEsc.Reset(observationsEscKey)
+	}
+	// The recorded-gap leg of the same column, from the feed-race recorder's own grain rather
+	// than from the capture's. It sits beside the observations leg for the same two reasons that
+	// one gives — no page falls back to a live query for it, so until it lands its numbers are
+	// simply absent, and it is cheap — and immediately after it, because the two describe the
+	// same span and a reader comparing them across a cycle boundary would be comparing two
+	// windows. That adjacency is why it goes ahead of the conformance leg, whose own reason for
+	// being early is the weaker half of the same one.
+	//
+	// Escalation-gated, per CLAUDE.md's rule for periodic loops, and the reason is on the leg
+	// immediately above: the observations refresh failed on EVERY ten-minute cycle in production
+	// against a ClickHouse memory limit and "cost the strips silently because this measurement is
+	// additive and its failure is a WARN". This leg is additive the same way and fails the same
+	// way — a failure leaves the staleness-only reading it exists to replace, which on the page
+	// is indistinguishable from a plane nothing measures yet — so nothing about the symptom says
+	// a query is broken.
+	//
+	// One key for the step rather than one per stage: a fetch failure and a write failure are the
+	// same operational condition, "this leg has not landed", and splitting them would let a
+	// failure that alternates between the two never reach the threshold. The interval is a fixed
+	// ten minutes, so the default count of three describes a duration (~30 minutes to ERROR) and
+	// ErrorAfterDuration would only restate it.
+	var tobGapsEsc logger.Escalator
+	const tobGapsEscKey = "edge_multicast_tob_gaps"
+	refreshTOBGaps := func() {
+		rctx, cancel := context.WithTimeout(ctx, runTimeout)
+		defer cancel()
+		val, err := a.FetchEdgeMulticastTOBGaps(rctx)
+		if err != nil {
+			tobGapsEsc.Fail(slog.Default(), tobGapsEscKey,
+				"edge multicast tob gaps refresh failed", "error", err)
+			return
+		}
+		if err := a.WritePageCache(ctx, edgeMulticastTOBGapsCacheKey, val); err != nil {
+			tobGapsEsc.Fail(slog.Default(), tobGapsEscKey,
+				"edge multicast tob gaps cache write failed", "error", err)
+			return
+		}
+		tobGapsEsc.Reset(tobGapsEscKey)
 	}
 	// The conformance leg of the same page. It reads no ClickHouse at all — the verdicts exist
 	// only in a metrics store — so it costs the chain nothing but its own HTTP round trips, and
-	// it sits second for the same reason the observations leg sits first: no page falls back to
-	// a live query for it, so until it lands its column is simply absent.
+	// it sits near the front for the same reason the observations leg sits first: no page falls
+	// back to a live query for it, so until it lands its column is simply absent.
 	//
 	// A nil querier makes FetchEdgeMulticastConformance return an empty payload with no error,
 	// which is written and read as "no validator covers anything here". That is the correct
@@ -1033,6 +1092,7 @@ func (a *API) StartKalshiBackgroundRefresher(ctx context.Context) {
 	}
 	refresh := func() {
 		refreshObservations()
+		refreshTOBGaps()
 		refreshConformance()
 		refreshLatency()
 		refreshScoreboard("24h")

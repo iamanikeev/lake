@@ -914,7 +914,12 @@ function LastHeardCell({ group, now }: { group: EdgeMulticastGroup; now: number 
 // KalshiL2Lane, which documents why the message count is a duration rather than a fault count.
 function sequenceInstanceLine(i: EdgeMulticastChannelInstance): string {
   const from = i.publisher_source_ip ? `${i.publisher_source_ip} ` : ''
-  const head = `${from}ch${i.channel_id} @${i.node} (${i.capture_source}): ${i.messages.toLocaleString()} msgs`
+  // **The capture source can be empty**, and the parentheses go with it rather than rendering
+  // `@node ():`. A recorder series that matched no capture series carries no name for one —
+  // legitimate, since the recorder can cover a feed the capture does not — and both Go rollups
+  // already treat the empty name as its own case rather than as a name.
+  const source = i.capture_source ? ` (${i.capture_source})` : ''
+  const head = `${from}ch${i.channel_id} @${i.node}${source}: ${i.messages.toLocaleString()} msgs`
   // A stall every path at this vantage shares is the capture source going quiet — a market that
   // closed, not a path that died — and the line has to say which of the two it is, because the
   // status word next to it still reads 'stalled'.
@@ -934,10 +939,13 @@ function sequenceInstanceLine(i: EdgeMulticastChannelInstance): string {
     i.gap_books > 0 && i.messages > 0 && i.gap_messages
       ? `, ${((i.gap_messages / i.messages) * 100).toFixed(2)}% of messages arrived un-anchored`
       : ''
-  return (
-    `${head}, ${i.gap_books.toLocaleString()} book(s) gapped${rate}, ${i.resets.toLocaleString()} resets, ` +
-    `${i.snapshot_cycles.toLocaleString()} snapshot cycles`
-  )
+  // **Omitted where the plane cannot count them, never printed as zero.** The recorder's
+  // top-of-book grain has no `snapshot_end`, and this line already refuses to print zeros that
+  // would read as findings — "a series with gaps and no cycles is not recovering" is exactly
+  // the reading a zero here would invent.
+  const cycles =
+    i.snapshot_cycles_measured === false ? '' : `, ${i.snapshot_cycles.toLocaleString()} snapshot cycles`
+  return `${head}, ${i.gap_books.toLocaleString()} book(s) gapped${rate}, ${i.resets.toLocaleString()} resets${cycles}`
 }
 
 // The badge, shared by the group roll-up and the publisher lines. One instance per tooltip line:
