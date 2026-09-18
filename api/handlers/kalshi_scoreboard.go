@@ -319,6 +319,12 @@ type KalshiScoreboardResponse struct {
 	// PathLatency is the per-feed venue-to-receive latency (24h) — the headline comparison;
 	// nil until the background refresher computes it (too heavy for the request path).
 	PathLatency *KalshiPathLatency `json:"path_latency,omitempty"`
+	// RecorderRace is the feed-race recorder's own comparison — the venue's upstream against
+	// the multicast, per site. Its own cache entry with its own clock and its own window: it
+	// aggregates a view rather than a summary table, so it can serve fifteen minutes and not
+	// this page's windows. See kalshi_recorder_race.go. nil until the refresher lands one,
+	// and absent entirely where no recorder writes.
+	RecorderRace *KalshiRecorderRace `json:"recorder_race,omitempty"`
 	// Unconfigured reports that no comparison feed is configured in this environment, as
 	// distinct from a configured one that simply had no races in the window. The UI cannot
 	// tell those apart from empty slices, and guessing turns a capture outage into "nothing
@@ -378,6 +384,12 @@ func (a *API) FetchKalshiScoreboardData(ctx context.Context, window, symbol stri
 		// still meaningful, so attach it rather than dropping the one number that survives.
 		resp := emptyKalshiScoreboard(window, true)
 		a.attachKalshiPathLatency(ctx, resp)
+		// **And the race, for the same reason.** It compares the venue against its own
+		// republication and depends on no competitor at all, so "nobody configured a feed to
+		// race against" is not a reason to drop it. The page renders it outside its
+		// `unconfigured` gate, so returning here without it is how a panel goes missing in
+		// exactly the environment that has a recorder and no competitor.
+		a.attachKalshiRecorderRace(ctx, resp)
 		return resp, nil
 	}
 
@@ -582,8 +594,36 @@ func (a *API) FetchKalshiScoreboardData(ctx context.Context, window, symbol stri
 	}
 
 	a.attachKalshiPathLatency(ctx, resp)
+	a.attachKalshiRecorderRace(ctx, resp)
 
 	return resp, nil
+}
+
+// attachKalshiRecorderRace copies the background-refreshed recorder race onto a response.
+//
+// Best-effort and separately cached, for the same reason the path latency is: it is too slow
+// for a request. Absent until the refresher has populated it, which is the only state that
+// renders nothing at all.
+//
+// After that first cycle EVERY environment has a payload, including those where the race view
+// does not exist — the refresher writes one with `Measured` false. That is deliberate and is
+// what the flag is for: "nothing measures this race here" and "the recorders write here and
+// nothing paired" are different findings, and an environment with no instrument must not be
+// handed the second one. The UI renders the two apart and draws no table under either.
+func (a *API) attachKalshiRecorderRace(ctx context.Context, resp *KalshiScoreboardResponse) {
+	raw, err := a.readPageCache(ctx, kalshiRecorderRaceCacheKey)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	// **Attached even with no sites.** Zero sites means nothing cleared `observations = 2`
+	// in the window, which is what a dead recorder looks like — dropping it here would make
+	// a capture outage render identically to an environment that never had a recorder, and
+	// those have to look different. The absence of the payload is the "not measured here"
+	// signal; an empty one is a measurement that found nothing.
+	var rr KalshiRecorderRace
+	if json.Unmarshal(raw, &rr) == nil {
+		resp.RecorderRace = &rr
+	}
 }
 
 // attachKalshiPathLatency copies the background-refreshed 24h path latency onto a response.
@@ -1090,11 +1130,46 @@ func (a *API) StartKalshiBackgroundRefresher(ctx context.Context) {
 			slog.Warn("edge multicast conformance cache write failed", "error", err)
 		}
 	}
+	// The recorder's own race. It aggregates a view and not a summary table, so it is the
+	// slowest step here for the least data — ~40s for fifteen minutes, measured.
+	//
+	// **It runs BEFORE the scoreboard steps even so, because they embed its payload.**
+	// FetchKalshiScoreboardData attaches this cache entry into the blob each window is served
+	// from, so a chain that refreshed it afterwards would serve every 24h and 7d tab a
+	// previous-cycle race under a caption claiming the last fifteen minutes — and none at all
+	// for the first cycle after a deploy. Cost is the wrong axis to order a consumer against
+	// its own input; the path-latency step is ahead of them for the same reason.
+	//
+	// **Both failures escalate, because neither is visible from the page.** A refresh that
+	// keeps failing leaves the panel serving the last window it managed to compute, and all
+	// the page can say about it is the age beside the caption — which is a tell only for
+	// someone already looking. On a bare WARN a view that times out on every ten-minute cycle
+	// never reaches anyone. Separate keys for the read and the write, the split
+	// api/worker/pagecache.go makes for the same reason: they are different causes, and a read
+	// that starts working must not reset a write that is still failing.
+	refreshRecorderRace := func() {
+		rctx, cancel := context.WithTimeout(ctx, runTimeout)
+		defer cancel()
+		val, err := a.FetchKalshiRecorderRace(rctx)
+		if err != nil {
+			a.recorderRaceEsc.Fail(slog.Default(), kalshiRecorderRaceEscKey+":read",
+				"kalshi recorder race refresh failed", "error", err)
+			return
+		}
+		a.recorderRaceEsc.Reset(kalshiRecorderRaceEscKey + ":read")
+		if err := a.WritePageCache(ctx, kalshiRecorderRaceCacheKey, val); err != nil {
+			a.recorderRaceEsc.Fail(slog.Default(), kalshiRecorderRaceEscKey+":write",
+				"kalshi recorder race cache write failed", "error", err)
+			return
+		}
+		a.recorderRaceEsc.Reset(kalshiRecorderRaceEscKey + ":write")
+	}
 	refresh := func() {
 		refreshObservations()
 		refreshTOBGaps()
 		refreshConformance()
 		refreshLatency()
+		refreshRecorderRace()
 		refreshScoreboard("24h")
 		refreshScoreboard("7d")
 		refreshL2()
