@@ -2,10 +2,12 @@ package handlers
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -78,6 +80,42 @@ func RequireInternalDomain(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// internalAPIToken returns the static service token that stands in for an internal-domain
+// login, or "" when none is configured.
+func internalAPIToken() string {
+	return strings.TrimSpace(os.Getenv("AUTH_INTERNAL_API_TOKEN"))
+}
+
+// RequireInternalDomainOrAPIToken is RequireInternalDomain with a second way in: the static
+// bearer token in AUTH_INTERNAL_API_TOKEN, for service callers that have no Google login to
+// make. It is scoped by where it is mounted — the token opens exactly the routes it wraps and
+// not every internal-domain route, so a caller that needs one endpoint is not handed the rest.
+//
+// Two properties are load-bearing. An unset or blank token grants nothing: without that guard
+// every deployment that never configured one would accept a bare "Authorization: Bearer ",
+// since an empty secret matches an empty presentation. And a token caller is deliberately left
+// anonymous in the request context — the handlers that widen a payload for an internal account
+// (shred client IPs, ops tickets) go on treating it as an outsider, so mounting this on one of
+// them cannot disclose more than the route itself.
+//
+// The token rides the same Authorization: Bearer slot as a session token, so OptionalAuth runs
+// its session lookup against it first and misses: one indexed Postgres read per request, which
+// the per-IP query rate limit already bounds.
+func RequireInternalDomainOrAPIToken(next http.Handler) http.Handler {
+	domainOnly := RequireInternalDomain(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if want := internalAPIToken(); want != "" {
+			// ConstantTimeCompare returns 0 on a length mismatch without comparing, so a
+			// presented token of any length is safe to pass in.
+			if subtle.ConstantTimeCompare([]byte(extractBearerToken(r)), []byte(want)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		domainOnly.ServeHTTP(w, r)
 	})
 }
 

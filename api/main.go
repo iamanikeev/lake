@@ -679,7 +679,9 @@ func main() {
 		r.Get("/api/dz/publisher-check", api.GetPublisherCheck)
 		r.Get("/api/dz/edge/scoreboard", api.GetEdgeScoreboard)
 		// Internal only (unannounced venue): allowed-domain Google users only.
-		r.With(handlers.RequireInternalDomain).Get("/api/dz/hyperliquid/scoreboard", api.GetHyperliquidScoreboard)
+		// The Hyperliquid scoreboard also accepts the AUTH_INTERNAL_API_TOKEN bearer token, for
+		// service callers with no Google login to make; that token opens this route alone.
+		r.With(handlers.RequireInternalDomainOrAPIToken).Get("/api/dz/hyperliquid/scoreboard", api.GetHyperliquidScoreboard)
 		r.With(handlers.RequireInternalDomain).Get("/api/dz/kalshi/scoreboard", api.GetKalshiScoreboard)
 		r.With(handlers.RequireInternalDomain).Get("/api/dz/kalshi/l2-coverage", api.GetKalshiL2Coverage)
 		r.With(handlers.RequireInternalDomain).Get("/api/dz/kalshi/l2-completeness", api.GetKalshiL2Completeness)
