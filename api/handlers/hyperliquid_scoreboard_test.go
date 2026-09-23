@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/malbeclabs/lake/api/handlers"
 	apitesting "github.com/malbeclabs/lake/api/testing"
@@ -203,4 +204,97 @@ func TestHyperliquidScoreboard_HeadlineAndCompetitors(t *testing.T) {
 	assert.EqualValues(t, 4, hydro.Races)
 	// Lead p50 over the 3 DZ wins (1.0, 2.0, 3.0) = 2.0 (quantileTDigest(0.5), exact at this size).
 	assert.InDelta(t, 2.0, hydro.LeadP50Ms, 0.001)
+}
+
+// The scoreboard is an internal-only venue and the handler itself serves anyone who reaches
+// it — the middleware api/main.go mounts it behind is the whole of the enforcement. These
+// cases wrap the handler exactly as that route does, so a change on either side of the pair
+// lands here. What they cannot see is the mount itself: main.go builds its router inline
+// inside main(), so nothing here fails if that line stops naming this middleware.
+func TestGetHyperliquidScoreboard_Auth(t *testing.T) {
+	const token = "hyperliquid-scoreboard-test-token"
+
+	api := apitesting.NewTestAPIBare(t, testChDB)
+	createFeedsTable(t, api)
+	guarded := handlers.RequireInternalDomainOrAPIToken(http.HandlerFunc(api.GetHyperliquidScoreboard))
+
+	tests := []struct {
+		name     string
+		envToken string
+		auth     string
+		account  *handlers.Account
+		wantCode int
+	}{
+		{"service token is admitted", token, "Bearer " + token, nil, http.StatusOK},
+		{"internal google user is admitted", token, "", &handlers.Account{AccountType: "domain", IsInternalUser: true}, http.StatusOK},
+		{"anonymous caller is refused", token, "", nil, http.StatusForbidden},
+		{"wrong token is refused", token, "Bearer not-the-token", nil, http.StatusForbidden},
+		{"wallet user is refused", token, "", &handlers.Account{AccountType: "wallet"}, http.StatusForbidden},
+		// With no token configured the venue stays Google-only: a blank secret must not
+		// admit a blank presentation.
+		{"unconfigured token admits nobody", "", "Bearer ", nil, http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AUTH_INTERNAL_API_TOKEN", tt.envToken)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/dz/hyperliquid/scoreboard", nil)
+			if tt.auth != "" {
+				req.Header.Set("Authorization", tt.auth)
+			}
+			if tt.account != nil {
+				req = withAccount(req, tt.account)
+			}
+			rr := httptest.NewRecorder()
+			guarded.ServeHTTP(rr, req)
+
+			require.Equal(t, tt.wantCode, rr.Code)
+			if tt.wantCode == http.StatusOK {
+				var resp handlers.HyperliquidScoreboardResponse
+				require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+				assert.Equal(t, "1h", resp.Window)
+				return
+			}
+			// A refusal must not leak the payload it was guarding.
+			assert.NotContains(t, rr.Body.String(), "dz_win_share_pct")
+		})
+	}
+}
+
+// The token caller reaches the handler with no account in context, so the two ways in would
+// diverge the moment this endpoint started varying its payload by account. They must not:
+// the token is a way in, not a narrower view of the scoreboard.
+func TestGetHyperliquidScoreboard_TokenAndLoginSeeSamePayload(t *testing.T) {
+	const token = "hyperliquid-scoreboard-test-token"
+	t.Setenv("AUTH_INTERNAL_API_TOKEN", token)
+
+	api := apitesting.NewTestAPIBare(t, testChDB)
+	createFeedsTable(t, api)
+	insertPairwise(t, api, "tyo-rec1", "tyo", "BTC", 1000, 1, "tob_gcp_tyo_hl_mainnet1", "hydromancer_bbo", 1.0)
+	guarded := handlers.RequireInternalDomainOrAPIToken(http.HandlerFunc(api.GetHyperliquidScoreboard))
+
+	call := func(prepare func(*http.Request) *http.Request) handlers.HyperliquidScoreboardResponse {
+		t.Helper()
+		req := prepare(httptest.NewRequest(http.MethodGet, "/api/dz/hyperliquid/scoreboard?window=24h", nil))
+		rr := httptest.NewRecorder()
+		guarded.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+
+		var resp handlers.HyperliquidScoreboardResponse
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+		resp.GeneratedAt = time.Time{} // wall clock, not a property of the caller
+		return resp
+	}
+
+	viaToken := call(func(r *http.Request) *http.Request {
+		r.Header.Set("Authorization", "Bearer "+token)
+		return r
+	})
+	viaLogin := call(func(r *http.Request) *http.Request {
+		return withAccount(r, &handlers.Account{AccountType: "domain", IsInternalUser: true})
+	})
+
+	assert.Equal(t, viaLogin, viaToken)
+	assert.EqualValues(t, 1, viaToken.TotalRaces)
 }
